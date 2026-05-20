@@ -40,9 +40,12 @@ class DiscoveryConfig:
 class DownloadConfig:
     """第 2 阶段：下载。"""
 
-    # 目标分辨率上限。720p 对 world model 训练通常够用，且省带宽/磁盘。
-    max_height: int = 720
-    fps: int = 20  # 重采样到固定帧率，方便后续按帧对齐动作标签
+    # 目标分辨率上限。480p 对 world model 训练足够（通常还会再 resize 到 ≤256），
+    # 且大幅省带宽/磁盘。需要更高清细节（如 HUD 小字）再调回 720。
+    max_height: int = 480
+    # 目标输出帧率：在切片导出（export_clip 的 -r）时应用，保证最终干净片段为该帧率。
+    # 原始下载文件保留源帧率（不重采样），它只是中间产物。
+    fps: int = 20
     # 单个视频时长上限（秒），过滤掉超长合集。0 表示不限制。
     max_duration_s: int = 1800
     # YouTube 的 n-challenge 现在需要 EJS solver 脚本（从远程拉取）才能拿到全部清晰度。

@@ -12,7 +12,7 @@ discovery:
     - "https://www.youtube.com/watch?v=e8WaLAMoyNQ"
 
 download:
-  max_height: 720
+  max_height: 480
   fps: 20
   max_duration_s: 3600          # 第一遍建议挑个 5~10 分钟的短视频
 

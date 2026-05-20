@@ -53,7 +53,9 @@ def download_one(
 
     postprocessors = []
     if _has_ffmpeg():
-        # 用 ffmpeg 把帧率重采样到固定 fps。
+        # 仅做容器归一化为 mp4，方便 OpenCV 读取。
+        # 注意：不在这里重采样帧率——下载流若已是 mp4，转换器会跳过，-r 不生效。
+        # 帧率统一改到切片导出（export_clip 的 -r）那一步，对源文件保留原生帧率即可。
         postprocessors.append(
             {
                 "key": "FFmpegVideoConvertor",
@@ -71,8 +73,6 @@ def download_one(
         # 启用 EJS solver 远程组件，破解 YouTube n-challenge 拿全清晰度。
         **({"remote_components": cfg.remote_components} if cfg.remote_components else {}),
         "postprocessors": postprocessors,
-        # ffmpeg 重采样帧率（-r）。放 postprocessor_args 里透传给转码步骤。
-        "postprocessor_args": {"videoconvertor": ["-r", str(cfg.fps)]} if _has_ffmpeg() else {},
         **cfg.extra_ydl_opts,
     }
 
