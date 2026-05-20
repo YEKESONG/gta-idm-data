@@ -1,0 +1,32 @@
+# 默认 pipeline 配置。只需写想覆盖的字段，其余沿用 config.py 里的默认值。
+# 用法：python -m scripts.run_pipeline --config configs/default.yaml
+
+work_dir: data
+
+discovery:
+  platforms: [youtube, bilibili]   # twitch 不支持搜索，用下面的 seed_urls
+  queries:
+    - "GTA V gameplay no commentary"
+    - "GTA 5 free roam shooting no hud commentary"
+  max_results_per_query: 20
+  seed_urls: []                    # 例：Twitch 频道 VOD 列表 / B 站合集 URL
+
+download:
+  max_height: 720
+  fps: 20
+  max_duration_s: 1800
+
+segment:
+  mode: scene                      # scene | window
+  scene_threshold: 27.0
+  min_clip_seconds: 2.0
+  max_clip_seconds: 30.0
+  sample_fps: 2.0
+
+filter:
+  enabled_detectors: [death_screen, menu_shop, loading_black, motion]
+  bad_frame_ratio_to_drop: 0.25
+  min_motion_magnitude: 0.6
+  static_frame_ratio_to_drop: 0.6
+  classifier_ckpt: null            # 填 ResNet18 权重路径即可启用 ML 兜底
+  classifier_threshold: 0.5

@@ -1,0 +1,28 @@
+# 视频下载后端：支持 YouTube / Bilibili / Twitch 等数百个站点
+yt-dlp>=2024.1.0
+
+# 计算机视觉 / 数值计算（启发式过滤、光流、模板匹配）
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+
+# 场景切分（按镜头切片，比固定窗口更贴合 gameplay 片段边界）
+scenedetect>=0.6.2
+
+# 可选：可插拔 ML 分类器（GTA 帧分类 / 后续 IDM 复用）才需要 torch。
+# 默认的启发式过滤管线不依赖它，可先不装。
+# 注意：`pip install torch` 默认拉 CUDA 版（捆绑 1~2GB 的 NVIDIA 运行时）。
+# 无 GPU 或只想跑过滤时，装体积小得多的 CPU 版即可：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# torch>=2.1
+# torchvision>=0.16
+
+# 配置文件解析
+PyYAML>=6.0
+
+# 进度条
+tqdm>=4.65
+
+# 可选：死亡画面 "WASTED/BUSTED" 文字检测用的 OCR。
+# 未安装时框架会自动退回到纯模板/颜色启发式，不会报错。
+# pytesseract>=0.3.10

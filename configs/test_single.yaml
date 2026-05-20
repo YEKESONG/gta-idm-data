@@ -1,0 +1,32 @@
+# 第一遍跑通用：只处理 1 个指定视频，关掉搜索。
+# 用法：
+#   1) 把下面 seed_urls 换成一个真实的 GTA V gameplay 视频 URL
+#   2) python -m scripts.run_pipeline --config configs/test_single.yaml
+work_dir: data_test
+
+discovery:
+  platforms: []                 # 留空 = 不做关键词搜索
+  queries: []
+  max_results_per_query: 1
+  seed_urls:
+    - "https://www.youtube.com/watch?v=e8WaLAMoyNQ"
+
+download:
+  max_height: 720
+  fps: 20
+  max_duration_s: 3600          # 第一遍建议挑个 5~10 分钟的短视频
+
+segment:
+  mode: scene
+  scene_threshold: 27.0
+  min_clip_seconds: 2.0
+  max_clip_seconds: 30.0
+  sample_fps: 2.0
+
+filter:
+  enabled_detectors: [death_screen, menu_shop, loading_black, motion]
+  bad_frame_ratio_to_drop: 0.25
+  min_motion_magnitude: 0.6
+  static_frame_ratio_to_drop: 0.6
+  classifier_ckpt: null
+  classifier_threshold: 0.5
