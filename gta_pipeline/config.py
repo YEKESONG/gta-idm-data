@@ -113,9 +113,13 @@ class PipelineConfig:
     # 注意：① 多个并发下载会同时占磁盘（超长视频单个可达 10G+），磁盘紧张就设 1；
     #       ② 对 YouTube 并发太高可能触发限流(429)，建议 2~3。
     download_concurrency: int = 2
-    # 已下载、待处理视频的缓冲数（队列容量 = 背压）。下载快于处理时最多预存这么多个
+    # 已下载、待切片视频的缓冲数（队列容量 = 背压）。下载快于切片时最多预存这么多个
     # 就阻塞下载线程，避免一次性把上百个视频下满磁盘。磁盘紧张设 1。
     download_prefetch: int = 2
+    # 已切片、待过滤视频的缓冲数。切片在独立后台线程做（与过滤的进程池并行），
+    # 让「视频 N+1 的切片」和「视频 N 的过滤」重叠，消除场景检测时进程池空转的浪费。
+    # 注意它也占磁盘：已切片但未过滤的视频，原始文件仍需保留到过滤完。磁盘紧张设 1。
+    segment_prefetch: int = 1
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     download: DownloadConfig = field(default_factory=DownloadConfig)
     segment: SegmentConfig = field(default_factory=SegmentConfig)

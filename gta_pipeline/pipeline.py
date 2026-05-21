@@ -28,9 +28,13 @@ from .segment import Clip, sample_frames, segment_video
 def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
     """跑完整条流水线（批量、可断点续跑）。
 
-    采用**流式 + 下载预取**：后台线程并行下载视频放入有界队列，主线程从队列取出
-    逐个「切片 → 过滤 → 导出」。这样网络 I/O（下载）与 CPU 计算（切片/过滤）重叠进行，
-    而有界队列把磁盘占用限制在「正在下的 + 缓冲的」少数几个视频，适合大批量抓取。
+    采用**三级流水线**，三种资源同时干活、互不空等：
+
+        下载线程(网络IO) ─dl_q→ 切片线程(1核,场景检测) ─seg_q→ 主线程过滤(进程池,多核)
+
+    这样「视频 N+1 的下载/切片」与「视频 N 的过滤」重叠进行，消除了原来「切片时
+    进程池空转、过滤时主线程干等」的浪费。队列都有界（背压），把磁盘占用限制在
+    少数几个在途视频，适合大批量抓取。manifest / processed.txt 只在主线程串行写。
     """
     Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 
@@ -61,27 +65,39 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
         print("[pipeline] 没有待处理视频，结束。")
         return
 
-    # ---- 下载预取流水线：后台下载线程（生产者）+ 主线程处理（消费者）----
+    # ---- 三级流水线的并行参数 ----
     concurrency = max(1, cfg.download_concurrency)
-    prefetch = max(1, cfg.download_prefetch)
+    dl_prefetch = max(1, cfg.download_prefetch)
+    seg_prefetch = max(1, cfg.segment_prefetch)
     workers = _resolve_workers(cfg.num_workers)
     print(
-        f"[pipeline] 并行配置：下载线程 {concurrency}，预取缓冲 {prefetch} 个视频，"
-        f"过滤/导出进程 {workers}"
+        f"[pipeline] 并行配置：下载线程 {concurrency}（缓冲 {dl_prefetch}）→ "
+        f"切片线程 1（缓冲 {seg_prefetch}）→ 过滤/导出进程 {workers}"
     )
 
-    # ref_q：待下载任务（预填全部 ref + 每个下载线程一个结束标记）。
+    # 切片线程现在与过滤进程池并行跑，必须把主进程 OpenCV 的内部多线程关掉，
+    # 否则切片解码会和 12 个过滤进程抢核（超额订阅），整体反而更慢。
+    # 让场景检测稳定占约 1 个核，正好用上 _resolve_workers 留出的余量。
+    import cv2
+
+    cv2.setNumThreads(1)
+
+    stop_event = threading.Event()  # 达标时通知下载/切片线程停下
+
+    def _discard_raw(dl: DownloadedVideo | None) -> None:
+        """停止时清掉「下了但来不及处理」的原始文件，省磁盘。"""
+        if dl is not None and not cfg.keep_raw:
+            dl.path.unlink(missing_ok=True)
+
+    # --- 第 1 级：下载线程（生产者）。ref_q 预填全部 ref + 每线程一个结束标记 ---
     ref_q: queue.Queue = queue.Queue()
     for ref in todo:
         ref_q.put(ref)
     for _ in range(concurrency):
         ref_q.put(_DL_SENTINEL)
-    # out_q：已下载、待处理的视频（有界 = 背压：满了下载线程自动阻塞等消费）。
-    out_q: queue.Queue = queue.Queue(maxsize=prefetch)
-    stop_event = threading.Event()  # 达到目标时通知下载线程停下
+    dl_q: queue.Queue = queue.Queue(maxsize=dl_prefetch)  # 已下载 → 待切片（有界=背压）
 
     def _download_worker() -> None:
-        """生产者：不断从 ref_q 取任务下载，结果塞进 out_q。"""
         while not stop_event.is_set():
             ref = ref_q.get()
             if ref is _DL_SENTINEL:
@@ -91,60 +107,72 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
             except Exception as e:  # noqa: BLE001 — 单个下载失败不应拖垮整批
                 print(f"[pipeline] 下载 {_key(ref)} 出错：{e}")
                 dl = None
-            # 队列满则阻塞重试（背压）；期间若已 stop 就放弃投递并清掉白下的文件。
-            delivered = False
-            while not stop_event.is_set():
-                try:
-                    out_q.put((ref, dl), timeout=1.0)
-                    delivered = True
-                    break
-                except queue.Full:
-                    continue
-            if not delivered and dl is not None and not cfg.keep_raw:
-                dl.path.unlink(missing_ok=True)  # 已停止：丢弃未处理的下载，省磁盘
-        out_q.put(_DONE_SENTINEL)  # 通知主线程：本下载线程已退出
+            if not _put_until_stop(dl_q, (ref, dl), stop_event):
+                _discard_raw(dl)  # 已停止、没投递成功：丢弃白下的文件
+        dl_q.put(_DONE_SENTINEL)  # 本下载线程退出
+
+    # --- 第 2 级：切片线程。消费 dl_q，跑场景检测，产出 (ref, dl, clips) 到 seg_q ---
+    seg_q: queue.Queue = queue.Queue(maxsize=seg_prefetch)  # 已切片 → 待过滤（有界=背压）
+
+    def _segment_worker() -> None:
+        remaining_downloaders = concurrency  # 需收齐这么多个下载线程的结束标记
+        while remaining_downloaders > 0:
+            item = dl_q.get()
+            if item is _DONE_SENTINEL:
+                remaining_downloaders -= 1
+                continue
+            ref, dl = item
+            if stop_event.is_set() or dl is None:
+                _discard_raw(dl)  # 已停止 / 下载失败：不切片
+                continue
+            try:
+                clips = segment_video(dl, cfg.segment)
+            except Exception as e:  # noqa: BLE001 — 单个视频切片失败不应中断整批
+                print(f"[pipeline] 切片 {_key(ref)} 出错，跳过：{e}")
+                _discard_raw(dl)
+                continue
+            print(f"[pipeline] {dl.path.name}: 切出 {len(clips)} 个片段")
+            if not _put_until_stop(seg_q, (ref, dl, clips), stop_event):
+                _discard_raw(dl)  # 已停止、没投递成功：丢弃
+        seg_q.put(_DONE_SENTINEL)  # 切片线程退出（仅 1 个）
 
     threads = [threading.Thread(target=_download_worker, daemon=True) for _ in range(concurrency)]
+    threads.append(threading.Thread(target=_segment_worker, daemon=True))
     for t in threads:
         t.start()
 
-    # 2+3+4) 主线程消费：常驻进程池整条 pipeline 共用，检测器只构建一次。
-    # manifest 用追加模式且只在主线程写，续跑不丢记录、也不会多线程写冲突。
+    # --- 第 3 级：主线程过滤/导出。常驻进程池整条 pipeline 共用，检测器只构建一次。 ---
     kept_total = 0
     processed_count = 0
-    active = concurrency  # 还在运行的下载线程数；收到 _DONE_SENTINEL 递减
+    seg_active = 1  # 切片线程数；收到它的 _DONE_SENTINEL 即结束
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_filter_worker,
         initargs=(cfg.filter, cfg.segment.sample_fps),
     ) as pool, ManifestWriter(cfg.manifest_path) as manifest:
-        while active > 0:
-            item = out_q.get()
+        while seg_active > 0:
+            item = seg_q.get()
             if item is _DONE_SENTINEL:
-                active -= 1
+                seg_active -= 1
                 continue
-            ref, dl = item
-            # 已决定停止（达标）：把队列里残留的已下载视频丢弃，只等下载线程收尾。
+            ref, dl, clips = item
+            # 已决定停止（达标）：丢弃残留的已切片视频，只等线程收尾。
             if stop_event.is_set():
-                if dl is not None and not cfg.keep_raw:
-                    dl.path.unlink(missing_ok=True)
+                _discard_raw(dl)
                 continue
             # 已达目标累计时长则停止（达成需求即止，不必跑完所有候选）。
             if target_s and done_s >= target_s:
                 print(f"[pipeline] 已达目标 {cfg.target_hours}h（累计 {done_s / 3600:.1f}h），停止。")
                 stop_event.set()
-                if dl is not None and not cfg.keep_raw:
-                    dl.path.unlink(missing_ok=True)
+                _discard_raw(dl)
                 continue
-            if dl is None:
-                continue  # 下载失败/被跳过：不记 processed，下次可重试
             processed_count += 1
             print(
                 f"[pipeline] ({processed_count}/{len(todo)}, 累计 {done_s / 3600:.1f}h) "
-                f"处理 {_key(ref)} ..."
+                f"过滤 {_key(ref)} ..."
             )
             try:
-                kept_total += _process_video(dl, cfg, manifest, pool, workers)
+                kept_total += _filter_video(dl, clips, cfg, manifest, pool, workers)
             except Exception as e:  # noqa: BLE001 — 单个视频出错不应中断整批
                 print(f"[pipeline] 处理 {_key(ref)} 出错，跳过：{e}")
                 continue
@@ -164,6 +192,21 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
 # 和下载线程回报主线程的"我已退出"标记。用唯一对象做哨兵，避免与真实数据混淆。
 _DL_SENTINEL = object()
 _DONE_SENTINEL = object()
+
+
+def _put_until_stop(q: queue.Queue, item, stop_event: threading.Event) -> bool:
+    """把 item 放进有界队列，队列满则阻塞重试（背压）。
+
+    返回是否投递成功：若投递前/期间 stop_event 被置位则放弃（返回 False），
+    让上游能及时清理白做的产物并退出，而不是死等下游消费。
+    """
+    while not stop_event.is_set():
+        try:
+            q.put(item, timeout=1.0)
+            return True
+        except queue.Full:
+            continue
+    return False
 
 
 def _key(ref: VideoRef) -> str:
@@ -242,25 +285,26 @@ def _resolve_workers(num_workers: int) -> int:
     return max(1, min(cpu - 2, 12))
 
 
-def _process_video(
+def _filter_video(
     dl: DownloadedVideo,
+    clips: list[Clip],
     cfg: PipelineConfig,
     manifest: ManifestWriter,
     pool: ProcessPoolExecutor,
     workers: int,
 ) -> int:
-    """切片 + 过滤 + 导出单个视频。复用传入的常驻进程池（不再每个视频重建池）。"""
-    clips = segment_video(dl, cfg.segment)
+    """过滤 + 导出单个视频的片段（切片已由切片线程预先完成）。
+
+    复用传入的常驻进程池（不再每个视频重建池）。片段彼此独立，分给进程池并行做
+    「采样 + 过滤 + 导出」；manifest 只在主进程串行写，避免多进程并发写冲突。
+    """
     total = len(clips)
-    print(f"[pipeline] {dl.path.name}: 切出 {total} 个片段")
     if total == 0:
         return 0
 
     tasks = [(clip, cfg.clean_dir) for clip in clips]
     kept = 0
     done = 0
-    # 片段彼此独立 -> 分给进程池并行做「采样 + 过滤 + 导出」；
-    # manifest 只在主进程串行写，避免多进程并发写冲突。
     for result in pool.map(_filter_export_clip, tasks, chunksize=8):
         done += 1
         if result is not None:
