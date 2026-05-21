@@ -28,6 +28,11 @@ def main() -> None:
         action="store_true",
         help="只跑发现阶段并打印候选视频，不下载/不过滤",
     )
+    parser.add_argument(
+        "--refresh-discovery",
+        action="store_true",
+        help="忽略候选缓存，强制重新搜索（并覆盖缓存）",
+    )
     args = parser.parse_args()
 
     cfg = PipelineConfig.from_yaml(args.config) if args.config else PipelineConfig()
@@ -38,6 +43,9 @@ def main() -> None:
             queries=cfg.discovery.queries,
             seed_urls=cfg.discovery.seed_urls,
             max_results_per_query=cfg.discovery.max_results_per_query,
+            require_title_keywords=cfg.discovery.require_title_keywords,
+            cache_path=cfg.discovery_cache_path,
+            refresh=args.refresh_discovery,
         )
         print(f"发现 {len(refs)} 个候选：")
         for r in refs:
@@ -45,7 +53,7 @@ def main() -> None:
             print(f"  [{r.platform}] {dur:>6}  {r.title[:60]}  {r.url}")
         return
 
-    run(cfg)
+    run(cfg, refresh_discovery=args.refresh_discovery)
 
 
 if __name__ == "__main__":

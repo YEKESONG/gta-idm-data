@@ -86,8 +86,9 @@ def _scene_spans(path: Path, threshold: float) -> list[tuple[float, float]]:
         print("[segment] 未安装 scenedetect，回退到固定窗口切片。")
         return _window_spans(path, window=10.0)
 
+    print(f"[segment] 扫描镜头边界：{path.name}（超长视频这步较慢，下面会显示进度条）")
     try:
-        scenes = detect(str(path), ContentDetector(threshold=threshold))
+        scenes = detect(str(path), ContentDetector(threshold=threshold), show_progress=True)
     except Exception as e:  # noqa: BLE001
         print(f"[segment] 场景检测失败 ({e})，回退固定窗口。")
         return _window_spans(path, window=10.0)

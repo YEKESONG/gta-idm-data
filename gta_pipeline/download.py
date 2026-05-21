@@ -13,6 +13,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import DownloadConfig
 from .discovery import VideoRef
@@ -24,10 +25,36 @@ class DownloadedVideo:
     path: Path
     fps: int
     height: int
+    duration_s: float = 0.0  # 源视频时长，用于按累计小时数收集数据
 
 
 def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def _make_progress_hook():
+    """生成 yt-dlp 下载进度回调；每推进约 10% 打印一行（避免刷屏）。
+
+    即便 opts 里 quiet=True，progress_hooks 仍会被调用——这是静默下载时
+    仍能看到百分比的标准做法。每个视频用独立闭包，进度状态互不干扰。
+    """
+    state = {"last_pct": -10}
+
+    def hook(d: dict) -> None:
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            got = d.get("downloaded_bytes") or 0
+            if total:
+                pct = int(got * 100 / total)
+                if pct >= state["last_pct"] + 10:
+                    state["last_pct"] = pct
+                    speed = (d.get("speed") or 0) / 1e6
+                    print(f"[download]   {pct:3d}%  {got / 1e6:.0f}/{total / 1e6:.0f} MB  {speed:.1f} MB/s")
+        elif status == "finished":
+            print("[download]   分流下载完成，正在合并/转码 ...")
+
+    return hook
 
 
 def download_one(
@@ -67,35 +94,60 @@ def download_one(
         "format": fmt,
         "outtmpl": out_tmpl,
         "quiet": True,
+        "progress_hooks": [_make_progress_hook()],  # quiet 下仍打印下载百分比
         "ignoreerrors": True,
         "noplaylist": True,
         "merge_output_format": "mp4",
         # 启用 EJS solver 远程组件，破解 YouTube n-challenge 拿全清晰度。
         **({"remote_components": cfg.remote_components} if cfg.remote_components else {}),
+        # 批量抓取礼貌性：每次下载前随机等待，降低被站点限流的风险。
+        **(
+            {"sleep_interval": cfg.sleep_interval_s, "max_sleep_interval": cfg.sleep_interval_s * 2}
+            if cfg.sleep_interval_s > 0
+            else {}
+        ),
         "postprocessors": postprocessors,
         **cfg.extra_ydl_opts,
     }
+
+    # ---- 下载前先按时长粗筛：超长直接跳过，绝不把整段下到本地再丢弃 ----
+    # 优先用发现阶段已拿到的时长（discover 的 flat 模式通常已带 duration）；
+    # 拿不到时再做一次轻量探测（只解析元数据、不下载），代价远小于白下几个 G。
+    duration = ref.duration_s
+    if duration is None:
+        duration = _probe_duration(ref.url, opts)
+    if cfg.max_duration_s and duration and duration > cfg.max_duration_s:
+        print(
+            f"[download] 跳过超长视频 {ref.video_id} "
+            f"({duration:.0f}s > 上限 {cfg.max_duration_s}s)，未下载"
+        )
+        return None
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(ref.url, download=True)
     except Exception as e:  # noqa: BLE001 — 批处理里单个失败不应中断全局
         print(f"[download] 失败 {ref.url}: {e}")
+        _cleanup(out_dir, ref)  # 清掉可能残留的 .part / 半成品，避免堆积占盘
         return None
 
     if not info:
+        _cleanup(out_dir, ref)
         return None
 
-    # 时长超限的直接判废（在拿到完整 info 后才知道准确时长）。
-    duration = info.get("duration") or 0
+    # 兜底：万一发现阶段没给时长、探测也失败（duration 仍为 None），
+    # 这里用下载后拿到的准确 info 再校验一次时长。
+    duration = info.get("duration") or duration or 0
     if cfg.max_duration_s and duration > cfg.max_duration_s:
-        print(f"[download] 跳过超长视频 {ref.video_id} ({duration}s)")
+        print(f"[download] 跳过超长视频 {ref.video_id} ({duration:.0f}s)")
+        _cleanup(out_dir, ref)
         return None
 
     # 找到实际落盘的文件。
     produced = list(out_dir.glob(f"{ref.platform}_{ref.video_id}.*"))
     video_files = [p for p in produced if p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
     if not video_files:
+        _cleanup(out_dir, ref)
         return None
 
     return DownloadedVideo(
@@ -103,7 +155,39 @@ def download_one(
         path=video_files[0],
         fps=cfg.fps,
         height=min(cfg.max_height, info.get("height") or cfg.max_height),
+        duration_s=float(duration),
     )
+
+
+def _probe_duration(url: str, base_opts: dict[str, Any]) -> float | None:
+    """只解析元数据、不下载，拿到视频时长（秒）；失败返回 None。
+
+    用于下载前的时长粗筛：避免把超长视频整段下到本地后才发现超限。
+    只透传必要选项，保持探测轻量。
+    """
+    import yt_dlp
+
+    opts: dict[str, Any] = {"quiet": True, "skip_download": True, "ignoreerrors": True}
+    if base_opts.get("remote_components"):
+        opts["remote_components"] = base_opts["remote_components"]
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:  # noqa: BLE001 — 探测失败就当未知时长，交给下载后兜底
+        return None
+    if not info:
+        return None
+    dur = info.get("duration")
+    return float(dur) if dur else None
+
+
+def _cleanup(out_dir: Path, ref: VideoRef) -> None:
+    """删掉某视频在 out_dir 下的所有残留文件（含 .part / 分流的 .webm 等）。
+
+    下载失败或判废时调用，防止半成品堆积、占满磁盘。
+    """
+    for p in out_dir.glob(f"{ref.platform}_{ref.video_id}.*"):
+        p.unlink(missing_ok=True)
 
 
 def download_many(

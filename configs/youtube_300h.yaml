@@ -1,0 +1,72 @@
+# 目标：仅从 YouTube 累计抓取并切好 ~300 小时 GTA V 素材。
+# 强制要求：候选视频标题必须含 "GTA V" 或 "GTA5"（不区分大小写）。
+#
+# 用法：
+#   # 先干跑，检查关键词 + 标题过滤后的候选质量（强烈建议先看一眼）
+#   python -m scripts.run_pipeline --config configs/youtube_300h.yaml --discover-only
+#   # 正式跑（可随时 Ctrl+C；重跑自动断点续跑，累计时长跨重跑累加）
+#   python -m scripts.run_pipeline --config configs/youtube_300h.yaml
+#
+# 累计满 target_hours 小时的源视频后自动停止，不必跑完所有候选。
+work_dir: data
+
+target_hours: 250        # 累计满 300 小时源视频即停
+keep_raw: false          # 处理完即删原始片，省磁盘（干净片段已存 clean/）
+
+# 过滤+导出的并行进程数。0=自动（按 CPU 核数留余量；你这台 16 核 → 约 12 进程）。
+# 嫌占资源就调小（如 6）；想更快可设大（如 14）。每个片段独立处理，并行吃满多核。
+num_workers: 0
+
+discovery:
+  platforms: [youtube]   # 只用 YouTube
+  queries:
+    - "GTA V gameplay no commentary"
+    - "GTA 5 free roam no commentary"
+    - "GTA 5 shooting gameplay no commentary"
+    - "GTA V combat gameplay no commentary"
+    - "GTA 5 first person gameplay no commentary"
+    - "GTA V free roam shooting"
+    - "GTA 5 police shootout gameplay"
+    - "GTA V rampage gameplay no commentary"
+    - "GTA 5 walkthrough no commentary no hud"
+    - "GTA V 1080p gameplay no commentary"
+  max_results_per_query: 100   # 候选要足够多才凑得够 300h（搜索后段质量靠下面标题过滤兜底）
+  # 标题白名单：只保留标题含这些词之一的视频（不区分大小写）。
+  # 这是 OR 子串匹配，注意 "GTA 5"（带空格）与 "GTA5" 是不同子串。
+  # 如需也收无空格写法（GTA5/GTAV）以扩大覆盖，把它们加回列表即可。
+  require_title_keywords: ["GTA V", "GTA 5"]
+  # 想要更稳的高质量长素材，可加优质创作者的频道/播放列表 URL（yt-dlp 会展开成全部视频）：
+  seed_urls:
+    - "https://www.youtube.com/playlist?list=PLnZ2IpETvyWx-pV2pYO4pdsG8rsCfp-Wo"
+    - "https://www.youtube.com/playlist?list=PL4A_rH03rFEDF9wySQEwBMT1SFVZDEr6d"
+    - "https://www.youtube.com/playlist?list=PL4A_rH03rFEC-hLR_yZ78-TefxD1SONTn"
+    - "https://www.youtube.com/playlist?list=PL9MoLfABC7y5NXYXaCcWfzhHF09Pa2cxB"
+    - "https://www.youtube.com/watch?v=4EQkpLKDUyU"
+    # 下面两个超长录像(21h/17h)上次已完整下到 data/raw/，加进来确保重跑会切片处理
+    # （yt-dlp 检测到本地已有完整文件会跳过下载，直接复用，省 38h 下载）。
+    - "https://www.youtube.com/watch?v=BaxNtMFlhiw"
+    - "https://www.youtube.com/watch?v=xv3wFGGeIsI"
+
+download:
+  max_height: 480
+  fps: 20
+  # 不限制时长：连超长直播/录像（十几~二十几小时）也一并收，凑总时长最高效。
+  # 注意：单个超长视频的「切片+逐帧过滤」会很耗时（可能数小时），且处理期间
+  # 单个原始文件可达 10G+（处理完即删，keep_raw=false）。磁盘需留足临时空间。
+  max_duration_s: 0       # 0 = 不限时长
+  sleep_interval_s: 5.0   # 每个视频间随机等待，降低被 YouTube 限流风险
+
+segment:
+  mode: scene
+  scene_threshold: 27.0
+  min_clip_seconds: 2.0
+  max_clip_seconds: 30.0
+  sample_fps: 2.0
+
+filter:
+  enabled_detectors: [death_screen, menu_shop, loading_black, motion]
+  bad_frame_ratio_to_drop: 0.25
+  min_motion_magnitude: 0.6
+  static_frame_ratio_to_drop: 0.6
+  classifier_ckpt: null
+  classifier_threshold: 0.5

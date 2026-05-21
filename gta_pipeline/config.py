@@ -34,6 +34,9 @@ class DiscoveryConfig:
     max_results_per_query: int = 20
     # 直接给定的视频/频道/播放列表 URL（绕过搜索，适合 Bilibili/Twitch）。
     seed_urls: list[str] = field(default_factory=list)
+    # 标题白名单：候选视频标题（不区分大小写）必须**至少包含其中一个**才保留。
+    # 空列表 = 不按标题过滤。用于强制只要标题含 "GTA V"/"GTA5" 之类的视频。
+    require_title_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -48,6 +51,9 @@ class DownloadConfig:
     fps: int = 20
     # 单个视频时长上限（秒），过滤掉超长合集。0 表示不限制。
     max_duration_s: int = 1800
+    # 批量抓取时每个视频之间的随机等待（秒），降低被站点限流/封禁的风险。
+    # 0 = 不等待。批量大规模抓取建议设 3~10。
+    sleep_interval_s: float = 0.0
     # YouTube 的 n-challenge 现在需要 EJS solver 脚本（从远程拉取）才能拿到全部清晰度。
     # 默认开启 ejs:github（yt-dlp 官方推荐）。注意：这会下载并执行远程解算脚本，
     # 不想用远程组件就设为 []（但 YouTube 下载可能只剩低清晰度甚至失败）。
@@ -93,6 +99,23 @@ class FilterConfig:
 @dataclass
 class PipelineConfig:
     work_dir: str = "data"  # 所有产物的根目录
+    # 累计处理满这么多「小时的源视频」后自动停止。0 = 不限（处理完所有候选）。
+    # 用于"我要凑够 200 小时"这类按总时长收集数据的目标。
+    target_hours: float = 0.0
+    # 处理完一个视频后是否保留原始下载文件。批量大规模抓取时设 False 可大幅省磁盘
+    # （干净片段已导出到 clean/，原始片不再需要）。设 True 便于复查/重切。
+    keep_raw: bool = True
+    # 过滤+导出阶段的并行进程数。0 = 自动（按 CPU 核数留余量）。
+    # 每个片段独立处理，多进程并行可吃满多核，大幅加速过滤+导出。
+    num_workers: int = 0
+    # ---- 下载预取：让「下载（网络）」与「切片+过滤（CPU）」重叠进行 ----
+    # 同时进行的下载数。下载是网络 I/O 密集，可与 CPU 处理并行而不互相等。
+    # 注意：① 多个并发下载会同时占磁盘（超长视频单个可达 10G+），磁盘紧张就设 1；
+    #       ② 对 YouTube 并发太高可能触发限流(429)，建议 2~3。
+    download_concurrency: int = 2
+    # 已下载、待处理视频的缓冲数（队列容量 = 背压）。下载快于处理时最多预存这么多个
+    # 就阻塞下载线程，避免一次性把上百个视频下满磁盘。磁盘紧张设 1。
+    download_prefetch: int = 2
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     download: DownloadConfig = field(default_factory=DownloadConfig)
     segment: SegmentConfig = field(default_factory=SegmentConfig)
@@ -114,6 +137,16 @@ class PipelineConfig:
     @property
     def manifest_path(self) -> Path:
         return Path(self.work_dir) / "manifest.jsonl"  # 元数据清单
+
+    @property
+    def processed_log(self) -> Path:
+        # 已处理过的视频 key（platform_id），用于断点续跑时跳过。
+        return Path(self.work_dir) / "processed.txt"
+
+    @property
+    def discovery_cache_path(self) -> Path:
+        # 发现阶段的候选列表缓存；命中则重跑不再重新搜索，避免重复触发限流。
+        return Path(self.work_dir) / "discovery_cache.jsonl"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "PipelineConfig":

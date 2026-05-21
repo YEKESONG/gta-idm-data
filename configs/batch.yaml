@@ -1,0 +1,42 @@
+# 批量自动抓取 + 自动切片配置。
+# 用法：
+#   # 先干跑，看关键词会搜到哪些视频（不下载）
+#   python -m scripts.run_pipeline --config configs/batch.yaml --discover-only
+#   # 正式批量跑（可随时 Ctrl+C，下次重跑会断点续跑、跳过已处理的视频）
+#   python -m scripts.run_pipeline --config configs/batch.yaml
+work_dir: data
+
+# 处理完即删原始视频，省磁盘（干净片段已存到 clean/）。想复查原片就设 true。
+keep_raw: false
+
+discovery:
+  # YouTube/Bilibili 走关键词搜索；Twitch 没搜索接口，把频道/VOD URL 填到 seed_urls。
+  platforms: [youtube, bilibili]
+  queries:
+    - "GTA V gameplay no commentary"
+    - "GTA 5 free roam shooting no hud"
+    - "GTA V combat gameplay no commentary"
+    - "GTA 5 shootout gameplay"
+  max_results_per_query: 30          # 每个(平台,关键词)取多少个候选
+  seed_urls: []                      # 例：Twitch 频道 VOD 列表 / B 站合集 URL
+
+download:
+  max_height: 480
+  fps: 20
+  max_duration_s: 1800               # 跳过超长合集
+  sleep_interval_s: 5.0              # 每个视频间随机等待，降低被限流风险
+
+segment:
+  mode: scene
+  scene_threshold: 27.0
+  min_clip_seconds: 2.0
+  max_clip_seconds: 30.0
+  sample_fps: 2.0
+
+filter:
+  enabled_detectors: [death_screen, menu_shop, loading_black, motion]
+  bad_frame_ratio_to_drop: 0.25
+  min_motion_magnitude: 0.6
+  static_frame_ratio_to_drop: 0.6
+  classifier_ckpt: null
+  classifier_threshold: 0.5
