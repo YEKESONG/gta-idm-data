@@ -50,17 +50,20 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
     )
     print(f"[pipeline] 发现 {len(refs)} 个候选视频")
 
-    # 断点续跑：跳过此前已处理过的视频（来自 processed.txt，含各视频时长）。
+    # 断点续跑：跳过此前已处理过的视频（来自 processed.txt）。已处理视频不会被重复选中。
     processed = _load_processed(cfg.processed_log)
     todo = [r for r in refs if _key(r) not in processed]
-    done_s = sum(processed.values())  # 此前累计已处理的源视频秒数（跨重跑累加）
+    # target_hours 现在按「有效（干净片段）时长」计，而非源视频时长——源视频经切分+
+    # 过滤后产出率只约 40%，按源时长收会严重不足。续跑基线从已有 manifest 的干净片段
+    # 时长算起（而非 processed.txt 的源时长），新增量只统计本次实际保留下来的片段。
+    done_s = _existing_clean_seconds(cfg.manifest_path)
     target_s = cfg.target_hours * 3600  # 0 = 不限
     print(
         f"[pipeline] 其中 {len(refs) - len(todo)} 个已处理过"
-        f"（累计 {done_s / 3600:.1f}h），本次待处理 {len(todo)} 个"
+        f"（已有有效时长 {done_s / 3600:.1f}h），本次待处理 {len(todo)} 个"
     )
     if target_s:
-        print(f"[pipeline] 目标累计时长 {cfg.target_hours}h")
+        print(f"[pipeline] 目标有效（干净片段）时长 {cfg.target_hours}h")
     if not todo:
         print("[pipeline] 没有待处理视频，结束。")
         return
@@ -160,30 +163,32 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
             if stop_event.is_set():
                 _discard_raw(dl)
                 continue
-            # 已达目标累计时长则停止（达成需求即止，不必跑完所有候选）。
+            # 已达目标有效时长则停止（达成需求即止，不必跑完所有候选）。
             if target_s and done_s >= target_s:
-                print(f"[pipeline] 已达目标 {cfg.target_hours}h（累计 {done_s / 3600:.1f}h），停止。")
+                print(f"[pipeline] 已达目标 {cfg.target_hours}h（有效时长 {done_s / 3600:.1f}h），停止。")
                 stop_event.set()
                 _discard_raw(dl)
                 continue
             processed_count += 1
             print(
-                f"[pipeline] ({processed_count}/{len(todo)}, 累计 {done_s / 3600:.1f}h) "
+                f"[pipeline] ({processed_count}/{len(todo)}, 有效时长 {done_s / 3600:.1f}h) "
                 f"过滤 {_key(ref)} ..."
             )
             try:
-                kept_total += _filter_video(dl, clips, cfg, manifest, pool, workers)
+                kept_clips, kept_seconds = _filter_video(dl, clips, cfg, manifest, pool, workers)
+                kept_total += kept_clips
             except Exception as e:  # noqa: BLE001 — 单个视频出错不应中断整批
                 print(f"[pipeline] 处理 {_key(ref)} 出错，跳过：{e}")
                 continue
-            # 成功处理：记入 processed（带时长），累加小时数，按需删原始片省磁盘。
+            # 成功处理：记入 processed（带源时长，仅作记录/去重用），按需删原始片省磁盘。
+            # done_s 累加的是「本视频实际保留下来的干净片段时长」，对齐 target 的有效时长语义。
             _mark_processed(cfg.processed_log, _key(ref), dl.duration_s)
-            done_s += dl.duration_s
+            done_s += kept_seconds
             if not cfg.keep_raw:
                 dl.path.unlink(missing_ok=True)
 
     print(
-        f"[pipeline] 完成。累计源视频 {done_s / 3600:.1f}h，"
+        f"[pipeline] 完成。累计有效时长 {done_s / 3600:.1f}h，"
         f"本次新增干净片段 {kept_total} 个 -> {cfg.clean_dir}"
     )
 
@@ -228,6 +233,29 @@ def _load_processed(path: Path) -> dict[str, float]:
         else:
             out[line] = 0.0  # 旧格式：只有 key，时长按 0 计
     return out
+
+
+def _existing_clean_seconds(manifest_path: Path) -> float:
+    """累加已有 manifest 里所有干净片段的时长（秒），作为续跑的「有效时长」基线。
+
+    target_hours 按有效（干净片段）时长计，所以续跑要从已经导出的 clean 片段算起，
+    而不是 processed.txt 里记的源视频时长。manifest 是已保留片段的权威记录。
+    """
+    if not manifest_path.exists():
+        return 0.0
+    import json
+
+    total = 0.0
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+            total += float(o["end_s"]) - float(o["start_s"])
+        except (ValueError, KeyError):
+            continue  # 跳过损坏/不完整的行，不让基线统计中断
+    return total
 
 
 def _mark_processed(path: Path, key: str, duration_s: float) -> None:
@@ -292,18 +320,21 @@ def _filter_video(
     manifest: ManifestWriter,
     pool: ProcessPoolExecutor,
     workers: int,
-) -> int:
+) -> tuple[int, float]:
     """过滤 + 导出单个视频的片段（切片已由切片线程预先完成）。
 
     复用传入的常驻进程池（不再每个视频重建池）。片段彼此独立，分给进程池并行做
     「采样 + 过滤 + 导出」；manifest 只在主进程串行写，避免多进程并发写冲突。
+
+    返回 (保留片段数, 保留片段总时长秒)。时长用于按「有效时长」累计判停。
     """
     total = len(clips)
     if total == 0:
-        return 0
+        return 0, 0.0
 
     tasks = [(clip, cfg.clean_dir) for clip in clips]
     kept = 0
+    kept_seconds = 0.0
     done = 0
     for result in pool.map(_filter_export_clip, tasks, chunksize=8):
         done += 1
@@ -311,9 +342,10 @@ def _filter_video(
             clip, exported, decision = result
             manifest.write(clip, dl.ref.platform, exported, decision)
             kept += 1
+            kept_seconds += clip.duration
         if done % 100 == 0 or done == total:
             print(f"[pipeline]   过滤/导出进度 {done}/{total}，已保留 {kept}（{workers} 进程并行）")
-    return kept
+    return kept, kept_seconds
 
 
 def export_clip(clip: Clip, out_dir: Path) -> Path:
