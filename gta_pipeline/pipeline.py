@@ -53,6 +53,8 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
     # 断点续跑：跳过此前已处理过的视频（来自 processed.txt）。已处理视频不会被重复选中。
     processed = _load_processed(cfg.processed_log)
     todo = [r for r in refs if _key(r) not in processed]
+    # 按平台优先级排序：列在前面的平台先处理（如先 B 站 seed、再 YouTube）。
+    todo = _prioritize(todo, cfg.platform_priority)
     # target_hours 现在按「有效（干净片段）时长」计，而非源视频时长——源视频经切分+
     # 过滤后产出率只约 40%，按源时长收会严重不足。续跑基线从已有 manifest 的干净片段
     # 时长算起（而非 processed.txt 的源时长），新增量只统计本次实际保留下来的片段。
@@ -216,6 +218,19 @@ def _put_until_stop(q: queue.Queue, item, stop_event: threading.Event) -> bool:
 
 def _key(ref: VideoRef) -> str:
     return f"{ref.platform}_{ref.video_id}"
+
+
+def _prioritize(refs: list[VideoRef], priority: list[str]) -> list[VideoRef]:
+    """按平台优先级稳定排序：priority 里靠前的平台排前面，未列出的排最后。
+
+    下载线程按列表顺序 FIFO 取，所以靠前的平台会被先下载/处理。稳定排序保证
+    同一平台内部仍保持原发现顺序。priority 为空则原样返回（不改变顺序）。
+    """
+    if not priority:
+        return refs
+    rank = {p: i for i, p in enumerate(priority)}
+    last = len(priority)  # 未在 priority 中列出的平台统一排到最后
+    return sorted(refs, key=lambda r: rank.get(r.platform, last))
 
 
 def _load_processed(path: Path) -> dict[str, float]:

@@ -103,6 +103,10 @@ class PipelineConfig:
     # 注意：统计的是过滤后保留下来的干净片段时长，不是源视频时长（源视频经切分+过滤
     # 后产出率只约 40%）。续跑时基线从已有 manifest 的干净片段累加，已处理视频不重复选。
     target_hours: float = 0.0
+    # 候选视频的处理优先级（按平台）。列在前面的平台先下载/处理，未列出的排最后。
+    # 例：["bilibili", "youtube"] = 先把 B 站候选全部采集，再去 YouTube。
+    # 同一平台内保持发现顺序不变（稳定排序）。空列表 = 不排序，按发现顺序处理。
+    platform_priority: list[str] = field(default_factory=list)
     # 处理完一个视频后是否保留原始下载文件。批量大规模抓取时设 False 可大幅省磁盘
     # （干净片段已导出到 clean/，原始片不再需要）。设 True 便于复查/重切。
     keep_raw: bool = True

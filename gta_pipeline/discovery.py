@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -104,15 +105,29 @@ def _entry_to_ref(entry: dict[str, Any], platform: str) -> VideoRef | None:
         return None
     url = entry.get("url") or entry.get("webpage_url")
     vid = entry.get("id")
-    if not url or not vid:
+    if not url:
         return None
+    url = str(url)
     # flat 模式给的 url 有时是相对 id，补全成可下载的完整 URL。
-    if platform == "youtube" and not str(url).startswith("http"):
+    if platform == "youtube" and not url.startswith("http"):
         url = f"https://www.youtube.com/watch?v={url}"
+    # B 站的坑：① flat 展开的条目往往只有 url、没有 id 字段；② 多 P 视频（如「主线
+    # 剧情」合集）每个分 P 共用同一个 BV 号，仅靠 url 的 ?p=N 区分。统一从 url 解析
+    # 「BV 号 + 分 P 号」当唯一 video_id，否则要么取不到 id 被整批丢弃，要么几十个
+    # 分 P 被 _dedup 塌缩成 1 个、下载文件名互相覆盖，最终只下到第一集。
+    if platform == "bilibili":
+        bv = re.search(r"BV[0-9A-Za-z]+", url)
+        part = re.search(r"[?&]p=(\d+)", url)
+        base = bv.group(0) if bv else (str(vid) if vid else "")
+        if not base:
+            return None
+        vid = f"{base}_p{part.group(1)}" if part else base
+    if not vid:
+        return None
     return VideoRef(
         platform=platform,
         video_id=str(vid),
-        url=str(url),
+        url=url,
         title=entry.get("title") or "",
         duration_s=entry.get("duration"),
     )
@@ -141,6 +156,9 @@ def discover(
         refresh: True 时忽略缓存、强制重新搜索（并覆盖写回缓存）。
     """
     # 缓存命中：直接复用，一个网络请求都不发——这是断点续跑时最有效的限流防护。
+    # 但仍会增量展开「这次新加、之前没展开过的 seed_urls」并入缓存：让你随时往
+    # 配置里贴新的 B 站合集 URL，直接跑就会被采集，无需 --refresh-discovery 重搜
+    # 整轮关键词（那既慢又有限流风险）。已展开过的 seed 记在 sidecar 里，不重复展开。
     if cache_path is not None and not refresh:
         cached = _load_cache(cache_path)
         if cached:
@@ -148,7 +166,7 @@ def discover(
                 f"[discover] 复用候选缓存 {len(cached)} 个：{cache_path} "
                 f"（要重新搜索就删掉它，或加 --refresh-discovery）"
             )
-            return cached
+            return _augment_with_new_seeds(cached, seed_urls, cache_path)
 
     # 搜索结果与 seed_urls 结果分开收集：标题白名单只用于「关键词搜索」结果
     # （给搜索兜底质量）；seed_urls 是人工精选的可信来源，全部保留、不做标题过滤。
@@ -185,7 +203,69 @@ def discover(
     # 写回缓存：下次重跑直接复用，不再发起整轮搜索。
     if cache_path is not None and result:
         _save_cache(cache_path, result)
+        # 记录本轮已展开的 seed_urls，下次命中缓存时不会把它们当「新种子」重复展开。
+        _record_expanded_seeds(_seeds_log_path(cache_path), seed_urls)
         print(f"[discover] 候选已缓存到 {cache_path}（{len(result)} 个），重跑将直接复用。")
+    return result
+
+
+def _seeds_log_path(cache_path: Path) -> Path:
+    """记录「已展开过的 seed_urls」的 sidecar 文件，与候选缓存放一起。"""
+    return cache_path.with_name(cache_path.name + ".seeds")
+
+
+def _load_expanded_seeds(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()}
+
+
+def _record_expanded_seeds(path: Path, urls: list[str]) -> None:
+    """把已展开的 seed_urls 追加进 sidecar（去重后写，幂等）。"""
+    if not urls:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    have = _load_expanded_seeds(path)
+    new = [u for u in urls if u not in have]
+    if not new:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        for u in new:
+            f.write(u + "\n")
+
+
+def _augment_with_new_seeds(
+    cached: list[VideoRef], seed_urls: list[str], cache_path: Path
+) -> list[VideoRef]:
+    """缓存命中时，只展开「之前没展开过的 seed_urls」，把新候选并入缓存并返回。
+
+    这样可以随时往配置里追加新的精选 URL（如 B 站合集），直接跑就会被采集，
+    既不重搜整轮关键词（省时、防限流），也不会反复展开同一个 seed。
+    """
+    seeds_log = _seeds_log_path(cache_path)
+    expanded = _load_expanded_seeds(seeds_log)
+    new_seeds = [u for u in seed_urls if u not in expanded]
+    if not new_seeds:
+        return cached
+
+    print(f"[discover] 检测到 {len(new_seeds)} 个新种子 URL，增量展开并入缓存（不重搜关键词）")
+    have = {(r.platform, r.video_id) for r in cached}
+    added: list[VideoRef] = []
+    for url in new_seeds:
+        platform = _guess_platform(url)
+        for entry in _ydl_flat(url):
+            ref = _entry_to_ref(entry, platform)
+            if ref and (ref.platform, ref.video_id) not in have:
+                have.add((ref.platform, ref.video_id))
+                added.append(ref)
+        _discover_sleep()  # 限流保护：每个展开请求后随机稍歇
+
+    result = cached + added
+    if added:
+        _save_cache(cache_path, result)
+    # 即使某个种子没展开出新候选，也记录它，避免下次重复尝试展开。
+    _record_expanded_seeds(seeds_log, new_seeds)
+    print(f"[discover] 新种子增量新增 {len(added)} 个候选 → 缓存共 {len(result)} 个")
     return result
 
 

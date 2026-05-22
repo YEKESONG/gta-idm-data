@@ -17,7 +17,7 @@ import argparse
 
 from gta_pipeline import PipelineConfig
 from gta_pipeline.discovery import discover
-from gta_pipeline.pipeline import run
+from gta_pipeline.pipeline import _prioritize, run
 
 
 def main() -> None:
@@ -47,8 +47,15 @@ def main() -> None:
             cache_path=cfg.discovery_cache_path,
             refresh=args.refresh_discovery,
         )
-        print(f"发现 {len(refs)} 个候选：")
+        # 按 platform_priority 排序，让预览顺序和正式跑（run 内的处理顺序）一致。
+        refs = _prioritize(refs, cfg.platform_priority)
+        by_platform: dict[str, int] = {}
         for r in refs:
+            by_platform[r.platform] = by_platform.get(r.platform, 0) + 1
+        summary = "，".join(f"{p} {n}" for p, n in by_platform.items())
+        print(f"发现 {len(refs)} 个候选（{summary}）：")
+        for r in refs:
+            # B 站 flat 模式不返回时长，显示 ? 属正常，不影响下载（下载前会自动探测）。
             dur = f"{r.duration_s:.0f}s" if r.duration_s else "?"
             print(f"  [{r.platform}] {dur:>6}  {r.title[:60]}  {r.url}")
         return

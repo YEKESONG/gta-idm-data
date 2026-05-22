@@ -13,12 +13,17 @@ work_dir: data
 target_hours: 250        # 累计满 250 小时「有效（干净片段）」时长即停（非源视频时长）
 keep_raw: false          # 处理完即删原始片，省磁盘（干净片段已存 clean/）
 
+# 处理优先级：先把 B 站精选合集全部采集，再去 YouTube。同平台内保持发现顺序。
+platform_priority: [bilibili, youtube]
+
 # 过滤+导出的并行进程数。0=自动（按 CPU 核数留余量；你这台 16 核 → 约 12 进程）。
 # 嫌占资源就调小（如 6）；想更快可设大（如 14）。每个片段独立处理，并行吃满多核。
 num_workers: 0
 
 discovery:
-  platforms: [youtube]   # 只用 YouTube
+  # 只对 YouTube 做关键词搜索。B 站不开搜索（其搜索结果质量差），只用下面 seed_urls
+  # 里你精选的 B 站合集 URL —— seed_urls 不受标题白名单过滤，全部保留。
+  platforms: [youtube]
   queries:
     - "GTA V gameplay no commentary"
     - "GTA 5 free roam no commentary"
@@ -35,8 +40,20 @@ discovery:
   # 这是 OR 子串匹配，注意 "GTA 5"（带空格）与 "GTA5" 是不同子串。
   # 如需也收无空格写法（GTA5/GTAV）以扩大覆盖，把它们加回列表即可。
   require_title_keywords: ["GTA V", "GTA 5"]
-  # 想要更稳的高质量长素材，可加优质创作者的频道/播放列表 URL（yt-dlp 会展开成全部视频）：
+  # 精选 URL（频道/播放列表/合集/单视频，yt-dlp 会展开成全部视频）。不受标题过滤。
+  # 随时可往这里追加新 URL：直接重跑即可增量采集，无需 --refresh-discovery（已展开
+  # 过的种子记在 discovery_cache.jsonl.seeds 里，不会重复展开，也不会重搜 YouTube）。
   seed_urls:
+    # ---- B 站精选合集（platform_priority 里排在最前，会被优先采集）。共 278 集 ----
+    # 多 P 视频贴「不带 ?p= 的纯 BV URL」即可展开全部分 P；已去掉 vd_source 等会话参数。
+    - "https://www.bilibili.com/video/BV1indnBREvD"   # 63 集
+    - "https://www.bilibili.com/video/BV1W54y1x7wc"   # 77 集
+    - "https://www.bilibili.com/video/BV1BYrKBJEQZ"   # 45 集
+    - "https://www.bilibili.com/video/BV1AuPhzpEN7"   # 73 集
+    - "https://www.bilibili.com/video/BV1K83Vz8EJi"   # 20 集
+    # 继续往下追加你的其它 B 站合集（纯 BV URL，或 collectiondetail?sid=... 合集页）：
+    # - "https://www.bilibili.com/video/BVxxxxxxxxxx"
+    # ---- YouTube 精选 ----
     - "https://www.youtube.com/playlist?list=PLnZ2IpETvyWx-pV2pYO4pdsG8rsCfp-Wo"
     - "https://www.youtube.com/playlist?list=PL4A_rH03rFEDF9wySQEwBMT1SFVZDEr6d"
     - "https://www.youtube.com/playlist?list=PL4A_rH03rFEC-hLR_yZ78-TefxD1SONTn"
