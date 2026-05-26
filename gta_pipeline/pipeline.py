@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import queue
 import shutil
@@ -55,6 +56,9 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
     todo = [r for r in refs if _key(r) not in processed]
     # 按平台优先级排序：列在前面的平台先处理（如先 B 站 seed、再 YouTube）。
     todo = _prioritize(todo, cfg.platform_priority)
+    # 再把「本地 raw 已下好的视频」提到最前优先处理掉：先消化之前已下载的（含超长录像）、
+    # 省磁盘，也不让它们占着 raw 干等。其余顺序不变。
+    todo = _local_first(todo, cfg.raw_dir)
     # target_hours 现在按「有效（干净片段）时长」计，而非源视频时长——源视频经切分+
     # 过滤后产出率只约 40%，按源时长收会严重不足。续跑基线从已有 manifest 的干净片段
     # 时长算起（而非 processed.txt 的源时长），新增量只统计本次实际保留下来的片段。
@@ -150,8 +154,14 @@ def run(cfg: PipelineConfig, refresh_discovery: bool = False) -> None:
     kept_total = 0
     processed_count = 0
     seg_active = 1  # 切片线程数；收到它的 _DONE_SENTINEL 即结束
+    # 关键：必须用 spawn 而非默认的 fork 启动 worker。此时主进程已经起了下载/切片线程，
+    # fork 一个多线程进程会让 worker 继承「别的线程当时正持有、却永远不会释放」的底层锁
+    # （malloc / OpenCV / ffmpeg 全局锁），worker 一旦去拿该锁就永久死锁——表现为 worker
+    # 全部空转、主线程 pool.map 永远收不到结果、整条流水线挂起（曾卡死 2.5h）。spawn 启动
+    # 全新解释器、不继承父进程线程与锁状态，从根上消除这个死锁。
     with ProcessPoolExecutor(
         max_workers=workers,
+        mp_context=mp.get_context("spawn"),
         initializer=_init_filter_worker,
         initargs=(cfg.filter, cfg.segment.sample_fps),
     ) as pool, ManifestWriter(cfg.manifest_path) as manifest:
@@ -231,6 +241,25 @@ def _prioritize(refs: list[VideoRef], priority: list[str]) -> list[VideoRef]:
     rank = {p: i for i, p in enumerate(priority)}
     last = len(priority)  # 未在 priority 中列出的平台统一排到最后
     return sorted(refs, key=lambda r: rank.get(r.platform, last))
+
+
+def _local_first(refs: list[VideoRef], raw_dir: Path) -> list[VideoRef]:
+    """把「本地 raw 已有完整文件」的视频排到最前优先处理（其余顺序不变）。
+
+    已经下好的视频（尤其之前下的超长录像）先处理掉，既省磁盘、又不让它们白占着 raw
+    等很久。文件名形如 platform_videoid.ext，p.stem 正好等于 _key()。
+    """
+    if not raw_dir.exists():
+        return refs
+    local_keys = {
+        p.stem for p in raw_dir.iterdir()
+        if p.suffix.lower() in {".mp4", ".mkv", ".webm"}
+    }
+    if not local_keys:
+        return refs
+    local = [r for r in refs if _key(r) in local_keys]
+    rest = [r for r in refs if _key(r) not in local_keys]
+    return local + rest
 
 
 def _load_processed(path: Path) -> dict[str, float]:
@@ -317,6 +346,8 @@ def _filter_export_clip(task):
     if not decision.keep:
         return None
     exported = export_clip(clip, clean_dir)
+    if exported is None:
+        return None  # 裁剪失败/超时：丢弃该片段，不写进 manifest
     return (clip, exported, decision)
 
 
@@ -363,10 +394,11 @@ def _filter_video(
     return kept, kept_seconds
 
 
-def export_clip(clip: Clip, out_dir: Path) -> Path:
+def export_clip(clip: Clip, out_dir: Path) -> Path | None:
     """用 ffmpeg 把通过过滤的时间区间裁成独立 mp4。
 
     没有 ffmpeg 时不裁剪，清单里记录源视频 + 时间区间（训练时按区间读取即可）。
+    裁剪失败或超时返回 None（调用方据此丢弃该片段）。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{clip.clip_id}.mp4"
@@ -384,9 +416,17 @@ def export_clip(clip: Clip, out_dir: Path) -> Path:
         "-an",  # 去音轨（动作建模用不到）
         str(out_path),
     ]
+    # 必须给 timeout：裁一个 ≤30s 片段正常只需 ~1s，但对超长源文件个别片段可能卡死
+    # ffmpeg；没有 timeout 会让 worker 进程永久阻塞、拖挂整个进程池。超时则杀掉 ffmpeg、
+    # 丢弃该片段。300s 已是极宽松的上限。
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, timeout=300)
         return out_path
+    except subprocess.TimeoutExpired:
+        print(f"[export] ffmpeg 裁剪超时(>300s)，跳过 {clip.clip_id}")
+        out_path.unlink(missing_ok=True)  # 清理可能残留的半成品
+        return None
     except subprocess.CalledProcessError as e:
         print(f"[export] ffmpeg 裁剪失败 {clip.clip_id}: {e}")
-        return clip.source_path
+        out_path.unlink(missing_ok=True)
+        return None

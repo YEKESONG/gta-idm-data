@@ -110,13 +110,21 @@ def download_one(
         **cfg.extra_ydl_opts,
     }
 
+    # 本地已有完整文件（非 .part）则豁免时长上限：已经下好的视频（含之前下的超长录像）
+    # 直接复用、处理掉，不浪费已花的下载。时长上限只用于拦截「尚未下载的」新超长视频，
+    # 避免再白下几个 G。这样 max_duration_s 可常设，已下的超长仍会被消化。
+    have_local = any(
+        p.suffix.lower() in {".mp4", ".mkv", ".webm"}
+        for p in out_dir.glob(f"{ref.platform}_{ref.video_id}.*")
+    )
+
     # ---- 下载前先按时长粗筛：超长直接跳过，绝不把整段下到本地再丢弃 ----
     # 优先用发现阶段已拿到的时长（discover 的 flat 模式通常已带 duration）；
     # 拿不到时再做一次轻量探测（只解析元数据、不下载），代价远小于白下几个 G。
     duration = ref.duration_s
-    if duration is None:
+    if duration is None and not have_local:
         duration = _probe_duration(ref.url, opts)
-    if cfg.max_duration_s and duration and duration > cfg.max_duration_s:
+    if not have_local and cfg.max_duration_s and duration and duration > cfg.max_duration_s:
         print(
             f"[download] 跳过超长视频 {ref.video_id} "
             f"({duration:.0f}s > 上限 {cfg.max_duration_s}s)，未下载"
@@ -138,7 +146,7 @@ def download_one(
     # 兜底：万一发现阶段没给时长、探测也失败（duration 仍为 None），
     # 这里用下载后拿到的准确 info 再校验一次时长。
     duration = info.get("duration") or duration or 0
-    if cfg.max_duration_s and duration > cfg.max_duration_s:
+    if not have_local and cfg.max_duration_s and duration > cfg.max_duration_s:
         print(f"[download] 跳过超长视频 {ref.video_id} ({duration:.0f}s)")
         _cleanup(out_dir, ref)
         return None
