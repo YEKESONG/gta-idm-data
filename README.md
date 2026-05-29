@@ -33,7 +33,6 @@ pip install -r requirements.txt
 sudo apt install ffmpeg          # Debian/Ubuntu
 ```
 
-> ⚠️ 跑 pipeline 务必用 `gta_idm_data` 环境，默认的 `ml` 环境没有 `yt_dlp`。
 
 ---
 
