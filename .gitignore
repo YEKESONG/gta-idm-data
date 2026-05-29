@@ -221,3 +221,4 @@ __marimo__/
 **/clean/*
 **/raw/*
 *.zip
+**/processed.txt
